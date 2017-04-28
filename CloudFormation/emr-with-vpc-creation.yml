@@ -1,0 +1,203 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+    A template to create an EMR cluster with 2 security groups for EMR master
+    and slave instances. If VPC and Subnet ID are provided,
+    then it uses them to place the EMR cluster in; otherwise it uses
+    Networkish/vpc-public-subnet.yml as a nested stack to create a VPC with a
+    public subnet and uses them for EMR placement.
+
+Parameters:
+  KeyPair:
+    Description: Amazon EC2 Key Pair
+    Type: AWS::EC2::KeyPair::KeyName
+
+  EMRClusterName:
+    Description: The name of EMR cluster
+    Type: String
+    Default: "EMRCluster"
+
+  MasterInstanceType:
+    Description: The EC2 type of the master instance
+    Type: String
+    Default: m1.medium
+
+  MasterInstanceCount:
+    Description: The EC2 count of the master instance
+    Type: Number
+    Default: 1
+
+  SlaveInstanceType:
+    Description: The EC2 type of the core instance
+    Type: String
+    Default: m1.medium
+
+  SlaveInstanceCount:
+    Description: The EC2 count of the core instance(s)
+    Type: Number
+    Default: 1
+
+  EveryoneCanSSH:
+    Type: String
+    Description: If we are OK to set the security group ingress to 0.0.0.0/0 on port 22
+    AllowedValues:
+      - Yes
+      - No
+    Default: Yes
+
+  S3URLToVPCTemplate:
+    Type: String
+    Description: The S3 URL to Networkish/vpc-public-subnet.yml in this repository
+
+
+  # If EMRClusterVPCID or EMRClusterSubnetID are not provided,
+  # we run VPC resource nested stack. We need the VPC ID to create EMR master
+  # and core security groups
+  EMRClusterVPCID:
+    Type: String
+    Description: EMR cluster VPC ID
+    Default: ''
+  EMRClusterSubnetID:
+    Type: String
+    Description: EMR cluster subnet ID
+    Default: ''
+
+  # Should we use VPC nested stack (if a VPCID and SubnetID is not already provided above),
+  # these are the params we pass to it to create a VPC/Subnet for us
+  VPCName:
+    Type: String
+    Description: If a VPC is not already specified, we create a new one with this name
+    Default: "MyVPC"
+  VPCCIDR:
+    Type: String
+    Description: If a VPC is not already specified, we create a new one with this CIDR (X.X.0.0/16)
+    Default: "10.0.0.0/16"
+  SUBNETCIDR:
+    Type: String
+    Description: If a VPC is not already specified, we create it with a public subnet with this CIDR (X.X.0.0/16)
+    Default: "10.0.1.0/24"
+
+Conditions:
+  NeedsNewVPC:
+    !Or
+    - !Equals [ !Ref EMRClusterSubnetID, '' ]
+    - !Equals [ !Ref EMRClusterVPCID, '' ]
+  PubliclySSHable: !Equals [ !Ref EveryoneCanSSH, 'true' ]
+
+Resources:
+  # If a subnet ID is not specified for our EMR cluster,
+  # we create a VPC with public subnet ourselves!
+  VPC:
+    Type: AWS::CloudFormation::Stack
+    Condition: NeedsNewVPC
+    Properties:
+      Parameters:
+        VPCName: !Ref VPCName
+        VPCCIDR: !Ref VPCCIDR
+        SUBNETCIDR: !Ref SUBNETCIDR
+      TemplateURL: !Ref S3URLToVPCTemplate
+      TimeoutInMinutes: 30
+
+  MasterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: The security group for EMR master instance(s)
+      VpcId: !If [NeedsNewVPC, !GetAtt [ "VPC", "Outputs.VpcId" ], !Ref EMRClusterVPCID]
+      SecurityGroupEgress:
+        -
+          IpProtocol: -1
+          FromPort: "0"
+          ToPort: "65535"
+          CidrIp: "0.0.0.0/0"
+      SecurityGroupIngress:
+        -
+          IpProtocol: "tcp"
+          FromPort: !If [PubliclySSHable, "22", "0" ]
+          ToPort: !If [PubliclySSHable, "22", "0" ]
+          CidrIp: "0.0.0.0/0"
+
+  SlaveSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: The security group for EMR slave instance(s)
+      VpcId: !If [NeedsNewVPC, !GetAtt [ "VPC", "Outputs.VpcId" ], !Ref EMRClusterVPCID]
+      SecurityGroupEgress:
+        -
+          IpProtocol: -1
+          FromPort: "0"
+          ToPort: "65535"
+          CidrIp: "0.0.0.0/0"
+
+  # Creating the EMR cluster
+  EMRCluster:
+    Type: AWS::EMR::Cluster
+
+    Properties:
+      Instances:
+        Ec2KeyName:
+          Ref: KeyPair
+        Ec2SubnetId: !If [NeedsNewVPC, !GetAtt [ "VPC", "Outputs.PublicSubnet" ], !Ref EMRClusterSubnetID]
+        EmrManagedMasterSecurityGroup: !Ref MasterSecurityGroup
+        EmrManagedSlaveSecurityGroup: !Ref SlaveSecurityGroup
+        MasterInstanceGroup:
+          InstanceCount: !Ref MasterInstanceCount
+          InstanceType: !Ref MasterInstanceType
+          Market: ON_DEMAND
+          Name: Master
+        CoreInstanceGroup:
+          InstanceCount: !Ref SlaveInstanceCount
+          InstanceType: !Ref SlaveInstanceType
+          Market: ON_DEMAND
+          Name: Core
+        TerminationProtected: true
+
+      Applications:
+      - Name: Hadoop
+      - Name: Hive
+      - Name: Presto
+      - Name: Pig
+      - Name: Spark
+
+      Configurations:
+      - Classification: core-site
+        ConfigurationProperties:
+          hadoop.security.groups.cache.secs: '250'
+      - Classification: mapred-site
+        ConfigurationProperties:
+          mapred.tasktracker.map.tasks.maximum: '2'
+          mapreduce.map.sort.spill.percent: '90'
+          mapreduce.tasktracker.reduce.tasks.maximum: '5'
+      - Classification: hadoop-env
+        Configurations:
+        - Classification: export
+          ConfigurationProperties:
+            HADOOP_DATANODE_HEAPSIZE: '2048'
+      Name: EMRCluster
+      JobFlowRole: EMR_EC2_DefaultRole
+      ServiceRole: EMR_DefaultRole
+      ReleaseLabel: emr-5.0.0
+
+Outputs:
+  OpenPorts:
+    Description: The ingress ports we are opening
+    Value: !If [PubliclySSHable, "22", "0" ]
+
+  EMRMasterSecurityGroup:
+    Description: The security group of the master EMR node(s)
+    Value: !Ref MasterSecurityGroup
+
+  EMRSlaveSecurityGroup:
+    Description: The security group of the slave EMR node(s)
+    Value: !Ref SlaveSecurityGroup
+
+  EMRSubnetID:
+    Description: "The subnet ID our EMR cluster is placed in"
+    Value: !If [NeedsNewVPC, !GetAtt [ "VPC", "Outputs.PublicSubnet" ], !Ref EMRClusterSubnetID]
+
+  EMRClusterID:
+    Value: !Ref EMRCluster
+    Description: EMR cluster ID
+
+  EMRMasterPublicDNS:
+    Value: !GetAtt EMRCluster.MasterPublicDNS
+    Description: EMR master public DNS name
