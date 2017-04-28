@@ -128,7 +128,6 @@ Resources:
         Fn::Base64:
           !Sub |
               #!/bin/bash -xe
-              touch /tmp/blahbij
               INSTANCE_ID=`/usr/bin/curl -s http://169.254.169.254/latest/meta-data/instance-id`
               echo "${EnvironmentName}-servant-$INSTANCE_ID" > /etc/hostname
               hostname -F /etc/hostname;
